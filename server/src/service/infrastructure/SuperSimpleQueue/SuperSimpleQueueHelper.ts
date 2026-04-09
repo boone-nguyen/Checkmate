@@ -31,6 +31,7 @@ export interface ISuperSimpleQueueHelper {
 	getCleanupOrphanedJob(): () => Promise<void>;
 	getCleanupRetentionJob(): () => Promise<void>;
 	isInMaintenanceWindow(monitorId: string, teamId: string): Promise<boolean>;
+	getEscalationJob(): () => Promise<void>;
 }
 
 export interface MonitorActionDecision {
@@ -38,7 +39,7 @@ export interface MonitorActionDecision {
 	shouldResolveIncident: boolean;
 	shouldSendNotification: boolean;
 	incidentReason: "status_down" | "threshold_breach" | null;
-	notificationReason: "status_change" | "threshold_breach" | null;
+	notificationReason: "status_change" | "threshold_breach" | "escalation" | null;
 	thresholdBreaches?: {
 		cpu?: boolean;
 		memory?: boolean;
@@ -66,6 +67,7 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 	private incidentsRepository: IIncidentsRepository;
 	private geoChecksService: IGeoChecksService;
 	private geoChecksRepository: IGeoChecksRepository;
+	private escalationState: Map<string, { incidentId: string; nextEligibleAtByKey: Map<string, number> }>;
 
 	constructor(
 		logger: ILogger,
@@ -101,6 +103,7 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 		this.incidentsRepository = incidentsRepository;
 		this.geoChecksService = geoChecksService;
 		this.geoChecksRepository = geoChecksRepository;
+		this.escalationState = new Map();
 	}
 
 	get serviceName() {
@@ -184,7 +187,8 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 					method: "getMonitorJob",
 					stack: error instanceof Error ? error.stack : undefined,
 				});
-				throw error;
+				// Keep scheduler healthy: monitor/network/provider failures should not crash or fail the recurring job.
+				return;
 			}
 		};
 	};
@@ -200,24 +204,38 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 
 				// Get all valid team IDs
 				const validTeamIds = await this.teamsRepository.findAllTeamIds();
+				if (!validTeamIds || validTeamIds.length === 0) {
+					this.logger.warn({
+						message: "No valid teams returned; skipping orphan cleanup to avoid accidental mass deletion",
+						service: SERVICE_NAME,
+						method: "getCleanupOrphanedJob",
+					});
+					return;
+				}
 				this.logger.debug({
 					message: `Found ${validTeamIds.length} valid teams`,
 					service: SERVICE_NAME,
 					method: "getCleanupOrphanedJob",
 				});
 
-				// Remove orphaned monitors (monitors without a valid team)
-				const deletedMonitorCount = await this.monitorsRepository.deleteByTeamIdsNotIn(validTeamIds);
-				if (deletedMonitorCount > 0) {
-					this.logger.info({
-						message: `Deleted ${deletedMonitorCount} orphaned monitors`,
-						service: SERVICE_NAME,
-						method: "getCleanupOrphanedJob",
-					});
-				}
+				// Safety-first: never auto-delete monitors in background cleanup.
+				// Monitor deletion should go through explicit user/API flows that also remove scheduler jobs.
+				this.logger.info({
+					message: "Skipping automatic orphan monitor deletion",
+					service: SERVICE_NAME,
+					method: "getCleanupOrphanedJob",
+				});
 
 				// Remove orphaned monitorStats (stats without a valid monitor)
 				const allMonitorIds = await this.monitorsRepository.findAllMonitorIds();
+				if (!allMonitorIds || allMonitorIds.length === 0) {
+					this.logger.warn({
+						message: "No valid monitors returned; skipping monitor-linked orphan cleanup",
+						service: SERVICE_NAME,
+						method: "getCleanupOrphanedJob",
+					});
+					return;
+				}
 				this.logger.debug({
 					message: `Found ${allMonitorIds.length} valid monitors`,
 					service: SERVICE_NAME,
@@ -455,4 +473,116 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 
 		return decision;
 	}
+	getEscalationJob = () => {
+		return async () => {
+			try {
+				this.logger.debug({
+					message: "Starting escalation check",
+					service: SERVICE_NAME,
+					method: "getEscalationJob",
+				});
+
+				const monitors = await this.monitorsRepository.findAll();
+				if (!monitors) {
+					return;
+				}
+
+				for (const monitor of monitors) {
+					const notificationConfigs =
+						(monitor.notifications ?? [])
+							.filter((notification) => typeof notification !== "string")
+							.filter((notification) => notification?.escalation?.channelId && notification?.channelId) ?? [];
+					if (notificationConfigs.length === 0) {
+						this.escalationState.delete(monitor.id);
+						continue;
+					}
+
+					const activeIncident = await this.incidentsRepository.findActiveByMonitorId(monitor.id, monitor.teamId);
+					if (!activeIncident) {
+						this.escalationState.delete(monitor.id);
+						continue;
+					}
+
+					const currentState = this.escalationState.get(monitor.id);
+					const nextEligibleAtByKey = currentState?.incidentId === activeIncident.id ? currentState.nextEligibleAtByKey : new Map<string, number>();
+					const incidentStartTime = Number(activeIncident.startTime) || new Date(activeIncident.startTime).getTime();
+					const now = Date.now();
+					const incidentDurationMinutes = (now - incidentStartTime) / 1000 / 60;
+
+					for (const notification of notificationConfigs) {
+						if (!notification.escalation) {
+							continue;
+						}
+
+						const escalationKey = `${notification.channelId}:${notification.escalation.channelId}:${notification.escalation.delayMinutes}`;
+						const nextEligibleAt = nextEligibleAtByKey.get(escalationKey) ?? incidentStartTime + notification.escalation.delayMinutes * 60 * 1000;
+						if (incidentDurationMinutes < notification.escalation.delayMinutes || now < nextEligibleAt) {
+							continue;
+						}
+
+						try {
+							const sent = await this.notificationsService.handleNotifications(
+								{
+									...monitor,
+									notifications: [{ channelId: notification.escalation.channelId }],
+								},
+								{
+									monitorId: monitor.id,
+									teamId: monitor.teamId,
+									type: monitor.type,
+									status: false,
+									code: activeIncident.statusCode || 500,
+									message: activeIncident.message || "Monitor still down",
+									responseTime: 0,
+								},
+								{
+									shouldSendNotification: true,
+									notificationReason: "escalation",
+									shouldCreateIncident: false,
+									shouldResolveIncident: false,
+									incidentReason: null,
+								}
+							);
+
+							if (!sent) {
+								this.logger.warn({
+									message: `Escalation notification was not sent for monitor ${monitor.id}`,
+									service: SERVICE_NAME,
+									method: "getEscalationJob",
+									details: {
+										monitorChannelId: notification.channelId,
+										escalationChannelId: notification.escalation.channelId,
+										delayMinutes: notification.escalation.delayMinutes,
+									},
+								});
+								continue;
+							}
+						} catch (error: unknown) {
+							this.logger.warn({
+								message: `Failed to send escalation for monitor ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
+								service: SERVICE_NAME,
+								method: "getEscalationJob",
+								stack: error instanceof Error ? error.stack : undefined,
+							});
+							continue;
+						}
+
+						nextEligibleAtByKey.set(escalationKey, now + notification.escalation.delayMinutes * 60 * 1000);
+					}
+
+					this.escalationState.set(monitor.id, {
+						incidentId: activeIncident.id,
+						nextEligibleAtByKey,
+					});
+				}
+			} catch (error: unknown) {
+				this.logger.warn({
+					message: error instanceof Error ? error.message : "Unknown error",
+					service: SERVICE_NAME,
+					method: "getEscalationJob",
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
+		};
+	};
 }
