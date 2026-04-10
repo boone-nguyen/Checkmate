@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, Fragment } from "react";
 import { useEffect } from "react";
 import { logger } from "@/Utils/logger";
 import { useParams, useLocation, useNavigate } from "react-router";
@@ -780,7 +780,7 @@ const CreateMonitorPage = () => {
 					<Controller
 						name="notifications"
 						control={control}
-						render={({ field }) => {
+						render={({ field }): JSX.Element => {
 							const notificationOptions = (notifications ?? []).map((n) => ({
 								...n,
 								name: n.notificationName,
@@ -791,7 +791,7 @@ const CreateMonitorPage = () => {
 							);
 
 							if (selectedNotifications.length === 0) {
-								return null;
+								return <Fragment />;
 							}
 
 							return (
