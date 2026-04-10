@@ -57,14 +57,26 @@ export class NotificationMessageBuilder implements INotificationMessageBuilder {
 			return "monitor_still_down";
 		}
 
-		// Down status has highest priority (critical)
-		if (monitor.status === "down") {
+		// Use decision flags first so notification direction follows incident logic,
+		// even if monitor.status is stale for a short period.
+		if (decision.notificationReason === "status_change" && decision.shouldCreateIncident) {
 			return "monitor_down";
 		}
 
-		// Threshold breach (only if not down)
+		if (decision.notificationReason === "status_change" && decision.shouldResolveIncident) {
+			if (monitor.type === "hardware" && monitor.status === "up") {
+				return "threshold_resolved";
+			}
+			return "monitor_up";
+		}
+
 		if (decision.notificationReason === "threshold_breach") {
 			return "threshold_breach";
+		}
+
+		// Down status has highest priority (critical)
+		if (monitor.status === "down") {
+			return "monitor_down";
 		}
 
 		// Recovery from threshold breach (only for hardware monitors)

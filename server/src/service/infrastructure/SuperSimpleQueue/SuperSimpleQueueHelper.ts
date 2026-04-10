@@ -159,27 +159,34 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 				// Step 5.  Get decisions
 				const decision = this.evaluateMonitorAction(statusChangeResult);
 
-				// Step 6. Handle notifications (best effort, continue even in event of failure, don't wait)
+				// Step 6/7. Handle notifications + incidents (best effort, but await completion
+				// so scheduler runs for this monitor do not overlap and reorder alerts).
+				const sideEffects: Promise<unknown>[] = [];
 				if (decision.shouldSendNotification) {
-					this.notificationsService.handleNotifications(statusChangeResult.monitor, status, decision).catch((error: unknown) => {
-						this.logger.error({
-							message: `Error sending notifications for job ${statusChangeResult.monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
+					sideEffects.push(
+						this.notificationsService.handleNotifications(statusChangeResult.monitor, status, decision).catch((error: unknown) => {
+							this.logger.error({
+								message: `Error sending notifications for job ${statusChangeResult.monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
+								service: SERVICE_NAME,
+								method: "getMonitorJob",
+								stack: error instanceof Error ? error.stack : undefined,
+							});
+						})
+					);
+				}
+
+				sideEffects.push(
+					this.incidentService.handleIncident(statusChangeResult.monitor, statusChangeResult.code, decision, status).catch((error: unknown) => {
+						this.logger.warn({
+							message: `Error handling incident for job ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
 							service: SERVICE_NAME,
 							method: "getMonitorJob",
 							stack: error instanceof Error ? error.stack : undefined,
 						});
-					});
-				}
+					})
+				);
 
-				// Step 7. Handle incidents (best effort, don't wait)
-				this.incidentService.handleIncident(statusChangeResult.monitor, statusChangeResult.code, decision, status).catch((error: unknown) => {
-					this.logger.warn({
-						message: `Error handling incident for job ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
-						service: SERVICE_NAME,
-						method: "getMonitorJob",
-						stack: error instanceof Error ? error.stack : undefined,
-					});
-				});
+				await Promise.all(sideEffects);
 			} catch (error: unknown) {
 				this.logger.warn({
 					message: error instanceof Error ? error.message : "Unknown error",
@@ -498,6 +505,11 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 					}
 
 					const activeIncident = await this.incidentsRepository.findActiveByMonitorId(monitor.id, monitor.teamId);
+					if (monitor.status !== "down" && monitor.status !== "breached") {
+						this.escalationState.delete(monitor.id);
+						continue;
+					}
+
 					if (!activeIncident) {
 						this.escalationState.delete(monitor.id);
 						continue;
